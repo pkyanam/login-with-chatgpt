@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createInterface } from "node:readline";
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
-import type { ChatGPTTokens } from "@opencoredev/loginwithchatgpt-core";
+import type { ChatGPTTokens, ReasoningEffort } from "@opencoredev/loginwithchatgpt-core";
 
 export interface RealtimeDynamicTool {
   type: "function";
@@ -29,7 +29,7 @@ export interface RealtimeToolResult {
 }
 
 export interface RealtimeConfirmationResult {
-  /** JSON-serializable application result returned by `resolveConfirmation()`. */
+  /** Application result returned by `resolveConfirmation()` to direct server-side callers. */
   output: unknown;
   /** Optional short acknowledgement spoken through the native Live session. */
   speech?: string;
@@ -74,7 +74,7 @@ export interface StartRealtimeAppServerOptions {
    */
   model?: string;
   /** Defaults to `low` for responsive voice-tool turns. */
-  reasoningEffort?: string;
+  reasoningEffort?: ReasoningEffort;
 }
 
 type JsonObject = Record<string, unknown>;
@@ -107,6 +107,8 @@ export class ChatGPTRealtimeAppServerSession {
   private readonly options: ChatGPTRealtimeAppServerOptions;
   private readonly listeners = new Set<(event: RealtimeBridgeEvent) => void>();
   private process?: ChildProcessWithoutNullStreams;
+  private processStopped = false;
+  private closePromise?: Promise<void>;
   private home?: string;
   private threadId?: string;
   private requestId = 0;
@@ -116,7 +118,11 @@ export class ChatGPTRealtimeAppServerSession {
     reject: (error: Error) => void;
     timer: ReturnType<typeof setTimeout>;
   }>();
-  private notificationWaiters = new Map<string, Array<(params: JsonObject) => void>>();
+  private notificationWaiters = new Map<string, Array<{
+    resolve: (params: JsonObject) => void;
+    reject: (error: Error) => void;
+    timer: ReturnType<typeof setTimeout>;
+  }>>();
   private confirmations = new Map<string, PendingConfirmation>();
   private allowedTools: Set<string>;
 
@@ -140,78 +146,80 @@ export class ChatGPTRealtimeAppServerSession {
   async start(options: StartRealtimeAppServerOptions): Promise<string> {
     if (!options.sdp.trim()) throw new TypeError("`sdp` must be a non-empty WebRTC offer.");
     if (this.process) throw new Error("Realtime app-server session has already started.");
-    this.home = join(tmpdir(), `login-with-chatgpt-live-${this.id}`);
-    await mkdir(this.home, { recursive: false, mode: 0o700 });
-    await this.writeAuth(this.options.tokens);
-
     const command = this.options.command ?? [
       "codex", "--enable", "realtime_conversation", "app-server", "--stdio",
     ];
     const [executable, ...args] = command;
     if (!executable) throw new TypeError("App-server command cannot be empty.");
-    this.process = spawn(executable, args, {
-      cwd: this.options.cwd ?? this.home,
-      env: { ...process.env, CODEX_HOME: this.home, RUST_LOG: process.env["RUST_LOG"] ?? "warn" },
-      stdio: ["pipe", "pipe", "pipe"],
-    });
-    this.process.once("exit", () => {
-      if (!this.closed) this.emit({ type: "error", message: "Codex app-server stopped unexpectedly." });
-      for (const pending of this.pendingRequests.values()) {
-        clearTimeout(pending.timer);
-        pending.reject(new Error("Codex app-server stopped."));
+    const home = join(tmpdir(), `login-with-chatgpt-live-${this.id}`);
+    await mkdir(home, { recursive: false, mode: 0o700 });
+    this.home = home;
+
+    try {
+      await this.writeAuth(this.options.tokens);
+      this.process = spawn(executable, args, {
+        cwd: this.options.cwd ?? home,
+        env: appServerEnvironment(home),
+        stdio: ["pipe", "pipe", "pipe"],
+      });
+      this.process.once("error", (error) => this.handleProcessStop(error));
+      this.process.once("exit", () => this.handleProcessStop(new Error("Codex app-server stopped.")));
+      this.process.stdin.on("error", (error) => this.handleProcessStop(error));
+      createInterface({ input: this.process.stdout }).on("line", (line) => this.handleLine(line));
+      createInterface({ input: this.process.stderr }).on("line", () => {
+        // Deliberately avoid forwarding stderr: it may contain application context.
+      });
+
+      await this.expectResult("initialize", {
+        clientInfo: { name: "codex_desktop", title: "Codex Desktop", version: "1" },
+        capabilities: {
+          experimentalApi: true,
+          requestAttestation: true,
+          mcpServerOpenaiFormElicitation: true,
+          optOutNotificationMethods: [],
+        },
+      });
+      this.notify("initialized", {});
+      const thread = await this.expectResult("thread/start", {
+        cwd: this.options.cwd ?? home,
+        ephemeral: true,
+        approvalPolicy: "never",
+        sandbox: "read-only",
+        threadSource: "realtime_voice",
+        baseInstructions: this.options.executionInstructions ?? DEFAULT_EXECUTION_INSTRUCTIONS,
+        developerInstructions: this.options.executionInstructions ?? DEFAULT_EXECUTION_INSTRUCTIONS,
+        dynamicTools: [...this.options.tools, speakToolSpec()],
+        ...realtimeExecutionConfig(options),
+      });
+      const threadValue = asRecord(asRecord(thread["result"])?.["thread"]);
+      if (typeof threadValue?.["id"] !== "string") throw new Error("App-server returned no thread id.");
+      this.threadId = threadValue["id"];
+
+      const [, notification] = await Promise.all([
+        this.expectResult("thread/realtime/start", {
+          threadId: this.threadId,
+          outputModality: "audio",
+          clientManagedHandoffs: false,
+          flushTranscriptTailOnSessionEnd: true,
+          codexResponsesAsItems: false,
+          includeStartupContext: false,
+          prompt: this.options.realtimePrompt ?? DEFAULT_REALTIME_PROMPT,
+          transport: { type: "webrtc", sdp: options.sdp },
+          version: "v3",
+          voice: options.voice ?? "juniper",
+        }, 45_000),
+        this.waitForNotification("thread/realtime/sdp", 30_000),
+      ]);
+      const answer = notification["sdp"];
+      if (typeof answer !== "string" || !answer.trimStart().startsWith("v=0")) {
+        throw new Error("App-server returned an invalid SDP answer.");
       }
-      this.pendingRequests.clear();
-    });
-    createInterface({ input: this.process.stdout }).on("line", (line) => this.handleLine(line));
-    createInterface({ input: this.process.stderr }).on("line", () => {
-      // Deliberately avoid forwarding stderr: it may contain application context.
-    });
-
-    await this.expectResult("initialize", {
-      clientInfo: { name: "codex_desktop", title: "Codex Desktop", version: "1" },
-      capabilities: {
-        experimentalApi: true,
-        requestAttestation: true,
-        mcpServerOpenaiFormElicitation: true,
-        optOutNotificationMethods: [],
-      },
-    });
-    this.notify("initialized", {});
-    const thread = await this.expectResult("thread/start", {
-      cwd: this.options.cwd ?? this.home,
-      ephemeral: true,
-      approvalPolicy: "never",
-      sandbox: "read-only",
-      threadSource: "realtime_voice",
-      baseInstructions: this.options.executionInstructions ?? DEFAULT_EXECUTION_INSTRUCTIONS,
-      developerInstructions: this.options.executionInstructions ?? DEFAULT_EXECUTION_INSTRUCTIONS,
-      dynamicTools: [...this.options.tools, speakToolSpec()],
-      ...realtimeExecutionConfig(options),
-    });
-    const threadValue = asRecord(asRecord(thread["result"])?.["thread"]);
-    if (typeof threadValue?.["id"] !== "string") throw new Error("App-server returned no thread id.");
-    this.threadId = threadValue["id"];
-
-    const sdpNotification = this.waitForNotification("thread/realtime/sdp", 30_000);
-    await this.expectResult("thread/realtime/start", {
-      threadId: this.threadId,
-      outputModality: "audio",
-      clientManagedHandoffs: false,
-      flushTranscriptTailOnSessionEnd: true,
-      codexResponsesAsItems: false,
-      includeStartupContext: false,
-      prompt: this.options.realtimePrompt ?? DEFAULT_REALTIME_PROMPT,
-      transport: { type: "webrtc", sdp: options.sdp },
-      version: "v3",
-      voice: options.voice ?? "juniper",
-    }, 45_000);
-    const notification = await sdpNotification;
-    const answer = notification["sdp"];
-    if (typeof answer !== "string" || !answer.trimStart().startsWith("v=0")) {
-      throw new Error("App-server returned an invalid SDP answer.");
+      this.emit({ type: "session.started" });
+      return answer;
+    } catch (error) {
+      await this.close().catch(() => {});
+      throw error;
     }
-    this.emit({ type: "session.started" });
-    return answer;
   }
 
   onEvent(listener: (event: RealtimeBridgeEvent) => void): () => void {
@@ -246,15 +254,13 @@ export class ChatGPTRealtimeAppServerSession {
       this.confirmations.set(callId, pending);
       throw error;
     }
-    assertJsonSerializable(confirmed.output, "Confirmation output");
     if (confirmed.speech) {
       try {
         await this.speak(confirmed.speech);
-      } catch (error) {
-        const message = error instanceof Error ? error.message : String(error);
+      } catch {
         this.emit({
           type: "error",
-          message: `Confirmation completed, but its spoken acknowledgement failed: ${message}`,
+          message: "Confirmation completed, but its spoken acknowledgement failed.",
         });
       }
     }
@@ -270,22 +276,36 @@ export class ChatGPTRealtimeAppServerSession {
     });
   }
 
-  async close(): Promise<void> {
-    if (this.closed) return;
+  close(): Promise<void> {
+    return this.closePromise ??= this.closeInternal();
+  }
+
+  private async closeInternal(): Promise<void> {
     this.closed = true;
-    if (this.threadId && this.process?.exitCode === null) {
-      await this.expectResult("thread/realtime/stop", { threadId: this.threadId }, 5_000).catch(() => {});
+    try {
+      if (this.threadId && this.process?.exitCode === null) {
+        await this.expectResult("thread/realtime/stop", { threadId: this.threadId }, 5_000).catch(() => {});
+      }
+      try {
+        this.process?.stdin.end();
+      } catch {
+        // The process may already have failed; cleanup must still continue.
+      }
+      if (this.process?.pid && isProcessRunning(this.process)) {
+        const process = this.process;
+        if (!await waitForProcessExit(process, 2_000)) {
+          process.kill("SIGTERM");
+          if (!await waitForProcessExit(process, 2_000)) process.kill("SIGKILL");
+        }
+      }
+    } finally {
+      this.rejectPending(new Error("Codex app-server session closed."));
+      try {
+        if (this.home) await rm(this.home, { recursive: true, force: true });
+      } finally {
+        this.emit({ type: "session.closed" });
+      }
     }
-    this.process?.stdin.end();
-    if (this.process?.exitCode === null) {
-      const process = this.process;
-      const exited = new Promise<void>((resolve) => process.once("exit", () => resolve()));
-      const timeout = new Promise<void>((resolve) => setTimeout(resolve, 2_000));
-      await Promise.race([exited, timeout]);
-      if (process.exitCode === null) process.kill("SIGTERM");
-    }
-    if (this.home) await rm(this.home, { recursive: true, force: true });
-    this.emit({ type: "session.closed" });
   }
 
   private async writeAuth(tokens: ChatGPTTokens): Promise<void> {
@@ -324,9 +344,14 @@ export class ChatGPTRealtimeAppServerSession {
     const params = asRecord(message["params"]) ?? {};
     const waiters = this.notificationWaiters.get(method) ?? [];
     this.notificationWaiters.delete(method);
-    for (const waiter of waiters) waiter(params);
+    for (const waiter of waiters) {
+      clearTimeout(waiter.timer);
+      waiter.resolve(params);
+    }
     if (typeof id === "string" || typeof id === "number") {
-      void this.handleServerRequest(id, method, params);
+      void this.handleServerRequest(id, method, params).catch((error) => {
+        this.handleProcessStop(error instanceof Error ? error : new Error(String(error)));
+      });
     } else {
       this.handleNotification(method, params);
     }
@@ -361,8 +386,10 @@ export class ChatGPTRealtimeAppServerSession {
         return;
       }
       await this.handleTool(id, params);
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
+    } catch {
+      const message = method === "item/tool/call"
+        ? "Realtime tool execution failed."
+        : "Realtime app-server request failed.";
       if (method === "item/tool/call") {
         this.send({ id, result: dynamicToolResponse({ status: "error", message }, false) });
       } else {
@@ -404,6 +431,7 @@ export class ChatGPTRealtimeAppServerSession {
     const result = await this.options.executeTool(context);
     if (result.pendingConfirmation) {
       if (!this.options.confirmTool) throw new Error("Tool requested confirmation without confirmTool.");
+      if (this.confirmations.has(callId)) throw new Error("Tool confirmation call id is already pending.");
       assertJsonSerializable(result.pendingConfirmation.review, "Confirmation review");
       // A JSON-RPC request left open blocks subsequent realtime handoffs and
       // wedges the native session in "thinking". Return the structured pending
@@ -436,9 +464,9 @@ export class ChatGPTRealtimeAppServerSession {
         });
       }
     } else if (method === "thread/realtime/error") {
-      this.emit({ type: "error", message: String(params["message"] ?? params["error"] ?? "Realtime error") });
+      this.emit({ type: "error", message: "The Realtime service reported an error." });
     } else if (method === "thread/realtime/closed") {
-      this.emit({ type: "session.closed" });
+      void this.close().catch(() => this.emit({ type: "error", message: "Realtime cleanup failed." }));
     }
   }
 
@@ -450,7 +478,13 @@ export class ChatGPTRealtimeAppServerSession {
         reject(new Error(`Timed out waiting for ${method}.`));
       }, timeoutMs);
       this.pendingRequests.set(id, { resolve, reject, timer });
-      this.send({ id, method, params });
+      try {
+        this.send({ id, method, params });
+      } catch (error) {
+        clearTimeout(timer);
+        this.pendingRequests.delete(id);
+        reject(error instanceof Error ? error : new Error(String(error)));
+      }
     });
   }
 
@@ -472,13 +506,43 @@ export class ChatGPTRealtimeAppServerSession {
 
   private waitForNotification(method: string, timeoutMs: number): Promise<JsonObject> {
     return new Promise((resolve, reject) => {
-      const timer = setTimeout(() => reject(new Error(`Timed out waiting for ${method}.`)), timeoutMs);
-      const wrapped = (params: JsonObject) => {
-        clearTimeout(timer);
-        resolve(params);
+      const waiter = {
+        resolve,
+        reject,
+        timer: setTimeout(() => {
+          const waiters = this.notificationWaiters.get(method)?.filter((entry) => entry !== waiter);
+          if (waiters?.length) this.notificationWaiters.set(method, waiters);
+          else this.notificationWaiters.delete(method);
+          reject(new Error(`Timed out waiting for ${method}.`));
+        }, timeoutMs),
       };
-      this.notificationWaiters.set(method, [...(this.notificationWaiters.get(method) ?? []), wrapped]);
+      this.notificationWaiters.set(method, [...(this.notificationWaiters.get(method) ?? []), waiter]);
     });
+  }
+
+  private handleProcessStop(error: Error): void {
+    if (this.processStopped) return;
+    this.processStopped = true;
+    if (!this.closed) this.emit({ type: "error", message: "Codex app-server stopped unexpectedly." });
+    this.rejectPending(error);
+    void this.close().catch(() => {
+      this.emit({ type: "error", message: "Realtime cleanup failed." });
+    });
+  }
+
+  private rejectPending(error: Error): void {
+    for (const pending of this.pendingRequests.values()) {
+      clearTimeout(pending.timer);
+      pending.reject(error);
+    }
+    this.pendingRequests.clear();
+    for (const waiters of this.notificationWaiters.values()) {
+      for (const waiter of waiters) {
+        clearTimeout(waiter.timer);
+        waiter.reject(error);
+      }
+    }
+    this.notificationWaiters.clear();
   }
 
   private emit(event: RealtimeBridgeEvent): void {
@@ -490,6 +554,45 @@ export class ChatGPTRealtimeAppServerSession {
       }
     }
   }
+}
+
+const INHERITED_APP_SERVER_ENV = [
+  "PATH", "SystemRoot", "WINDIR", "TMPDIR", "TMP", "TEMP", "LANG", "LC_ALL",
+  "SSL_CERT_FILE", "SSL_CERT_DIR", "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY",
+  "http_proxy", "https_proxy", "no_proxy",
+] as const;
+
+function appServerEnvironment(home: string): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = {
+    CODEX_HOME: home,
+    RUST_LOG: process.env["RUST_LOG"] ?? "warn",
+  };
+  for (const key of INHERITED_APP_SERVER_ENV) {
+    if (process.env[key] !== undefined) env[key] = process.env[key];
+  }
+  return env;
+}
+
+function isProcessRunning(process: ChildProcessWithoutNullStreams): boolean {
+  return process.exitCode === null && process.signalCode === null;
+}
+
+function waitForProcessExit(
+  process: ChildProcessWithoutNullStreams,
+  timeoutMs: number,
+): Promise<boolean> {
+  if (!isProcessRunning(process)) return Promise.resolve(true);
+  return new Promise((resolve) => {
+    const finish = (exited: boolean) => {
+      clearTimeout(timer);
+      process.removeListener("exit", onExit);
+      resolve(exited);
+    };
+    const onExit = () => finish(true);
+    const timer = setTimeout(() => finish(!isProcessRunning(process)), timeoutMs);
+    process.once("exit", onExit);
+    if (!isProcessRunning(process)) finish(true);
+  });
 }
 
 function speakToolSpec(): RealtimeDynamicTool {

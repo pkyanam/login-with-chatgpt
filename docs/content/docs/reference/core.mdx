@@ -120,6 +120,10 @@ Video and screen-sharing media are not exposed by these SDK helpers.
   server-only SDP exchange primitive.
 - `buildChatGPTRealtimeSession(options?)` maps typed camel-case options to the
   upstream session wire object.
+- `parseChatGPTRealtimeSessionOptions(value)` validates the complete public
+  session contract at JSON and untyped JavaScript boundaries.
+- `parseChatGPTRealtimeTranscript(event)` extracts user speech and assistant
+  captions; `connectChatGPTRealtime()` also exposes this as `onTranscript`.
 - `createChatGPTRealtimeAction()`, `encodeChatGPTRealtimeEvent()`, and
   `parseChatGPTRealtimeEvent()` support custom WebRTC clients;
   `getChatGPTRealtimePayload()` normalizes nested payload envelopes.
@@ -127,8 +131,9 @@ Video and screen-sharing media are not exposed by these SDK helpers.
   `createChatGPTRealtimeToolUpdate()`, and
   `createChatGPTRealtimeToolResult()` expose only the reserved direct `/wm`
   client-tool lifecycle.
-- `CHATGPT_REALTIME_PATHS` and `CHATGPT_REALTIME_EVENT_TYPES` expose the known
-  mode routes and forward-compatible event catalog.
+- `CHATGPT_REALTIME_PATHS`, `CHATGPT_REALTIME_EVENT_TYPES`, and
+  `CHATGPT_REALTIME_VOICES` expose the known routes, event catalog, and current
+  documented voice names without closing the wire API to future values.
 
 The full types, schema, modes, and lifecycle are in
 [Experimental ChatGPT voice transport](/docs/guides/realtime-voice).

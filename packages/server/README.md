@@ -91,7 +91,8 @@ onUnmount(() => live.close());
 
 The handler owns the user-scoped process, opaque session id, event stream,
 model propagation, timeout, and cleanup. `ChatGPTRealtimeAppServerSession`
-remains exported for custom backends that need the lower-level protocol. See the
+remains available from `@opencoredev/loginwithchatgpt-server/realtime-app-server`
+for custom Node/Bun backends that need the lower-level protocol. See the
 [Realtime voice guide](../../docs/content/docs/guides/realtime-voice.mdx).
 
 ## Security defaults

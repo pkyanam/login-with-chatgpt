@@ -3,6 +3,12 @@ import { ChatGPTAuthError } from "./errors.ts";
 
 export type ChatGPTRealtimeTransport = "wm" | "vp" | "vps";
 export type ChatGPTRealtimeVoiceMode = "wingman" | "advanced" | "standard";
+/** Voice names currently documented by ChatGPT. The wire API remains open to newer names. */
+export const CHATGPT_REALTIME_VOICES = [
+  "arbor", "breeze", "cove", "ember", "juniper",
+  "maple", "sol", "spruce", "vale",
+] as const;
+export type ChatGPTRealtimeVoice = typeof CHATGPT_REALTIME_VOICES[number];
 export type ChatGPTRealtimeState =
   | "connecting"
   | "idle"
@@ -40,6 +46,58 @@ export interface ChatGPTRealtimeSessionOptions {
   conversationMode?: Record<string, unknown>;
   historyAndTrainingDisabled?: boolean;
   enableMessageStreaming?: boolean;
+}
+
+const REALTIME_SESSION_OPTION_KEYS = new Set<keyof ChatGPTRealtimeSessionOptions>([
+  "transport", "voice", "voiceMode", "model", "advancedModel", "language",
+  "conversationId", "parentMessageId", "timezone", "timezoneOffsetMinutes",
+  "clientTools", "conversationMode", "historyAndTrainingDisabled",
+  "enableMessageStreaming",
+]);
+
+/** Validates the public session contract at a JSON or JavaScript trust boundary. */
+export function parseChatGPTRealtimeSessionOptions(
+  value: unknown,
+): ChatGPTRealtimeSessionOptions {
+  if (!isRecord(value)) throw new TypeError("`session` must be a JSON object.");
+  for (const key of Object.keys(value)) {
+    if (!REALTIME_SESSION_OPTION_KEYS.has(key as keyof ChatGPTRealtimeSessionOptions)) {
+      throw new TypeError(`Unsupported Realtime session option: ${key}`);
+    }
+  }
+  for (const key of ["voice", "model", "advancedModel", "parentMessageId", "timezone"] as const) {
+    if (value[key] !== undefined && typeof value[key] !== "string") {
+      throw new TypeError(`\`session.${key}\` must be a string.`);
+    }
+  }
+  for (const key of ["language", "conversationId"] as const) {
+    if (value[key] !== undefined && value[key] !== null && typeof value[key] !== "string") {
+      throw new TypeError(`\`session.${key}\` must be a string or null.`);
+    }
+  }
+  for (const key of ["historyAndTrainingDisabled", "enableMessageStreaming"] as const) {
+    if (value[key] !== undefined && typeof value[key] !== "boolean") {
+      throw new TypeError(`\`session.${key}\` must be a boolean.`);
+    }
+  }
+  if (value["timezoneOffsetMinutes"] !== undefined && typeof value["timezoneOffsetMinutes"] !== "number") {
+    throw new TypeError("`session.timezoneOffsetMinutes` must be a number.");
+  }
+  if (value["clientTools"] !== undefined && !Array.isArray(value["clientTools"])) {
+    throw new TypeError("`session.clientTools` must be an array.");
+  }
+  if (value["conversationMode"] !== undefined && !isRecord(value["conversationMode"])) {
+    throw new TypeError("`session.conversationMode` must be a JSON object.");
+  }
+  if (value["transport"] !== undefined &&
+      (typeof value["transport"] !== "string" || !["wm", "vp", "vps"].includes(value["transport"]))) {
+    throw new TypeError("`session.transport` must be `wm`, `vp`, or `vps`.");
+  }
+  if (value["voiceMode"] !== undefined &&
+      (typeof value["voiceMode"] !== "string" || !["wingman", "advanced", "standard"].includes(value["voiceMode"]))) {
+    throw new TypeError("`session.voiceMode` must be `wingman`, `advanced`, or `standard`.");
+  }
+  return { ...value } as ChatGPTRealtimeSessionOptions;
 }
 
 /** The multipart `session` object accepted by ChatGPT's web Realtime edge. */
@@ -186,6 +244,12 @@ export interface ChatGPTRealtimeTranscriptionEvent extends ChatGPTRealtimeEvent 
   transcript?: string;
 }
 
+export interface ChatGPTRealtimeTranscript {
+  kind: "user_transcript" | "assistant_caption";
+  text: string;
+  event: ChatGPTRealtimeTranscriptionEvent;
+}
+
 export interface ChatGPTRealtimeToolInvocation {
   callId: string;
   name: string;
@@ -232,13 +296,8 @@ export const CHATGPT_REALTIME_PATHS: Record<ChatGPTRealtimeTransport, string> = 
 export function buildChatGPTRealtimeSession(
   options: ChatGPTRealtimeSessionOptions = {},
 ): ChatGPTRealtimeSession {
-  if (options.voiceMode !== undefined && !["wingman", "advanced", "standard"].includes(options.voiceMode)) {
-    throw new TypeError("`voiceMode` must be `wingman`, `advanced`, or `standard`.");
-  }
+  options = parseChatGPTRealtimeSessionOptions(options);
   const transport = options.transport ?? "wm";
-  if (!["wm", "vp", "vps"].includes(transport)) {
-    throw new TypeError("`transport` must be `wm`, `vp`, or `vps`.");
-  }
   const expectedVoiceMode = transport === "wm" ? "wingman" : transport === "vps" ? "standard" : "advanced";
   if (options.voiceMode !== undefined && options.voiceMode !== expectedVoiceMode) {
     throw new TypeError(`\`voiceMode\` must be \`${expectedVoiceMode}\` for the \`${transport}\` transport.`);
@@ -247,6 +306,7 @@ export function buildChatGPTRealtimeSession(
     throw new TypeError("`historyAndTrainingDisabled` must be false for ChatGPT `/wm`.");
   }
   const voice = options.voice ?? "juniper";
+  const language = normalizeRealtimeLanguage(options.language);
   // Let the subscription service select its current model unless the caller
   // explicitly targets a compatibility transport model. Do not pin legacy
   // product models in SDK defaults.
@@ -255,9 +315,6 @@ export function buildChatGPTRealtimeSession(
   if (model.length > 128) throw new TypeError("`model` must be at most 128 characters.");
   if (transport !== "wm" && !model.trim()) {
     throw new TypeError("`model` is required for the undocumented `vp` and `vps` compatibility transports.");
-  }
-  if (options.clientTools !== undefined && !Array.isArray(options.clientTools)) {
-    throw new TypeError("`clientTools` must be an array.");
   }
   if (options.clientTools?.length) {
     throw new TypeError(
@@ -272,7 +329,7 @@ export function buildChatGPTRealtimeSession(
   const voiceMode = options.voiceMode ?? expectedVoiceMode;
   const session: ChatGPTRealtimeSession = {
     conversation_id: options.conversationId ?? null,
-    language_code: options.language ?? null,
+    language_code: language,
     requested_default_model: model,
     voice,
     voice_session_id: id,
@@ -325,7 +382,7 @@ export async function createChatGPTRealtimeCall(
   headers.set("Authorization", `Bearer ${auth.accessToken}`);
   if (auth.accountId) headers.set("chatgpt-account-id", auth.accountId);
   headers.set("Accept", "application/sdp");
-  headers.set("OAI-Language", options.session?.language ?? "en-US");
+  headers.set("OAI-Language", session.language_code ?? "en-US");
   headers.set("OAI-Device-Id", auth.deviceId ?? createUuid());
   headers.set("OAI-Client-Version", options.config.realtimeClientVersion);
   headers.set("OAI-Client-Build-Number", options.config.realtimeClientBuild);
@@ -460,6 +517,23 @@ export function getChatGPTRealtimePayload(event: ChatGPTRealtimeEvent): Record<s
   return isRecord(event["payload"]) ? event["payload"] : event;
 }
 
+/** Extracts the user transcript or spoken assistant caption from a known event. */
+export function parseChatGPTRealtimeTranscript(
+  event: ChatGPTRealtimeEvent,
+): ChatGPTRealtimeTranscript | undefined {
+  if (event.type !== "user_transcription_text" && event.type !== "live_captioning_text") {
+    return undefined;
+  }
+  const payload = getChatGPTRealtimePayload(event);
+  const text = payload["text"] ?? payload["transcript"];
+  if (typeof text !== "string" || !text) return undefined;
+  return {
+    kind: event.type === "user_transcription_text" ? "user_transcript" : "assistant_caption",
+    text,
+    event: event as ChatGPTRealtimeTranscriptionEvent,
+  };
+}
+
 function decodeWireValue(value: unknown): unknown {
   if (value instanceof ArrayBuffer) return new TextDecoder().decode(value);
   if (ArrayBuffer.isView(value)) {
@@ -481,6 +555,18 @@ function decodeWireValue(value: unknown): unknown {
 
 function assignDefined(target: Record<string, unknown>, key: string, value: unknown): void {
   if (value !== undefined) target[key] = value;
+}
+
+function normalizeRealtimeLanguage(language: string | null | undefined): string | null {
+  if (language == null) return null;
+  if (!language.trim() || language.length > 64) {
+    throw new TypeError("`language` must be a valid BCP 47 language tag of at most 64 characters.");
+  }
+  try {
+    return Intl.getCanonicalLocales(language)[0] ?? null;
+  } catch {
+    throw new TypeError("`language` must be a valid BCP 47 language tag.");
+  }
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

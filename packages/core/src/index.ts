@@ -49,6 +49,7 @@ export {
 export {
   CHATGPT_REALTIME_EVENT_TYPES,
   CHATGPT_REALTIME_PATHS,
+  CHATGPT_REALTIME_VOICES,
   buildChatGPTRealtimeSession,
   createChatGPTRealtimeAction,
   createChatGPTRealtimeRelayMessage,
@@ -59,6 +60,8 @@ export {
   encodeChatGPTRealtimeEvent,
   getChatGPTRealtimePayload,
   parseChatGPTRealtimeEvent,
+  parseChatGPTRealtimeSessionOptions,
+  parseChatGPTRealtimeTranscript,
   parseChatGPTRealtimeToolInvocation,
   type ChatGPTRealtimeAction,
   type ChatGPTRealtimeActionEvent,
@@ -74,11 +77,13 @@ export {
   type ChatGPTRealtimeState,
   type ChatGPTRealtimeStateEvent,
   type ChatGPTRealtimeTranscriptionEvent,
+  type ChatGPTRealtimeTranscript,
   type ChatGPTRealtimeToolInvocation,
   type ChatGPTRealtimeToolInvokeEvent,
   type ChatGPTRealtimeToolResultEvent,
   type ChatGPTRealtimeToolUpdateEvent,
   type ChatGPTRealtimeVoiceMode,
+  type ChatGPTRealtimeVoice,
   type CreateChatGPTRealtimeCallOptions,
 } from "./realtime.ts";
 export {
@@ -93,5 +98,6 @@ export {
   parseChatGPTRealtimeAppServerEvent,
   type ChatGPTRealtimeAppServerConnection,
   type ChatGPTRealtimeAppServerEvent,
+  type ChatGPTRealtimeAppServerSessionOptions,
   type ConnectChatGPTRealtimeAppServerOptions,
 } from "./realtime-app-server-browser.ts";

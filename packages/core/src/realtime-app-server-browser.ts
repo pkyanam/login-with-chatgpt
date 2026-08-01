@@ -4,6 +4,9 @@ import {
   type ChatGPTRealtimeConnection,
   type ConnectChatGPTRealtimeOptions,
 } from "./realtime-browser.ts";
+import type { ChatGPTRealtimeSessionOptions } from "./realtime.ts";
+
+const MAX_APP_SERVER_EVENT_CHARS = 256 * 1024;
 
 export type ChatGPTRealtimeAppServerEvent =
   | { type: "session.started" }
@@ -21,13 +24,20 @@ export type ChatGPTRealtimeAppServerEvent =
   | { type: "error"; message: string }
   | { type: "keepalive" };
 
+export type ChatGPTRealtimeAppServerSessionOptions = Pick<
+  ChatGPTRealtimeSessionOptions,
+  "voice" | "model"
+>;
+
 export interface ConnectChatGPTRealtimeAppServerOptions
-  extends Omit<ConnectChatGPTRealtimeOptions, "endpoint"> {
+  extends Omit<ConnectChatGPTRealtimeOptions, "endpoint" | "session"> {
   /**
    * Cookie-authenticated app-server route. Defaults to
    * `/api/chatgpt/realtime/app-server`.
    */
   endpoint?: string;
+  /** Options understood by the app-server bridge. */
+  session?: ChatGPTRealtimeAppServerSessionOptions;
   onBridgeEvent?: (event: ChatGPTRealtimeAppServerEvent) => void;
 }
 
@@ -124,11 +134,6 @@ export async function connectChatGPTRealtimeAppServer(
     if (isExpectedStreamCancellation(cause)) return;
     options.onError?.(cause instanceof Error ? cause : new Error(String(cause)));
   };
-  if (options.signal) {
-    const abort = () => eventsAbort.abort(options.signal?.reason);
-    options.signal.addEventListener("abort", abort, { once: true });
-  }
-
   void streamAppServerEvents(
     fetchImpl,
     `${endpoint}/${encodedSessionId}/events`,
@@ -143,10 +148,14 @@ export async function connectChatGPTRealtimeAppServer(
     },
   ).catch(report);
 
-  const closeServer = () => {
+  function abortServer(): void {
+    void closeServer().catch(report);
+  }
+  function closeServer(): Promise<void> {
     if (closePromise) return closePromise;
     serverClosed = true;
     eventsAbort.abort();
+    options.signal?.removeEventListener("abort", abortServer);
     closePromise = fetchImpl(`${endpoint}/${encodedSessionId}`, {
       method: "DELETE",
       credentials: "include",
@@ -158,7 +167,11 @@ export async function connectChatGPTRealtimeAppServer(
       );
     });
     return closePromise;
-  };
+  }
+  if (options.signal) {
+    options.signal.addEventListener("abort", abortServer, { once: true });
+    if (options.signal.aborted) abortServer();
+  }
 
   const closeConnection = connection.close;
   return Object.assign(connection, {
@@ -181,6 +194,7 @@ export async function connectChatGPTRealtimeAppServer(
     closeServer,
     close: () => {
       closeConnection();
+      options.signal?.removeEventListener("abort", abortServer);
       if (!serverClosed) void closeServer().catch(report);
     },
   });
@@ -248,8 +262,12 @@ async function streamAppServerEvents(
     while (true) {
       const { done, value } = await reader.read();
       buffer += decoder.decode(value, { stream: !done });
-      let newline = buffer.indexOf("\n");
-      while (newline >= 0) {
+      while (true) {
+        const newline = buffer.indexOf("\n");
+        if ((newline < 0 ? buffer.length : newline) > MAX_APP_SERVER_EVENT_CHARS) {
+          throw new Error("Realtime app-server event exceeded the maximum line length.");
+        }
+        if (newline < 0) break;
         const line = buffer.slice(0, newline).trim();
         buffer = buffer.slice(newline + 1);
         if (line) {
@@ -260,7 +278,6 @@ async function streamAppServerEvents(
             // Ignore malformed status lines without interrupting native audio.
           }
         }
-        newline = buffer.indexOf("\n");
       }
       if (done) break;
     }

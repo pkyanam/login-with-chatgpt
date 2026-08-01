@@ -78,12 +78,12 @@ those APIs. The routes it serves are documented in [HTTP routes](routes.mdx).
 | `confirmTool` | callback | unset | Required when any tool returns `pendingConfirmation`; called only by the authenticated confirmation route. |
 | `allowedModels` | `readonly string[] \| (model: string) => boolean` | all allowed | Restricts the delegated execution model selected by the browser. |
 | `defaultModel` | `string` | unset | Delegated execution model when the browser omits one. |
-| `reasoningEffort` | `string` | `"low"` | App-server execution effort; low keeps voice-tool turns responsive. |
+| `reasoningEffort` | `ReasoningEffort` | `"low"` | App-server execution effort; low keeps voice-tool turns responsive. |
 | `sessionTtlMs` | `number` | `1_800_000` | Maximum Live process lifetime. A new call also closes the previous call for that login session. |
 | `command` | `readonly string[]` | `codex --enable realtime_conversation app-server --stdio` | App-server executable override. |
 | `executionInstructions` | `string` | built-in tool-use instructions | Instructions for delegated execution turns. |
 | `realtimePrompt` | `string` | built-in native voice prompt | Prompt for the interruptible voice surface. |
-| `sessionFactory` | callback | built-in session | Advanced process-hosting or test override. |
+| `sessionFactory` | `(options) => RealtimeAppServerSessionHandle` | built-in session | Advanced process-hosting or test override using the minimal lifecycle contract. |
 
 The handler adds `request`, `loginSessionId`, and `liveSessionId` to tool and
 confirmation callbacks. Tokens stay inside the SDK. Tool results must be

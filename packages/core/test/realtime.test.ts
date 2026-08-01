@@ -10,6 +10,8 @@ import {
   exchangeChatGPTRealtimeWebSession,
   getChatGPTRealtimePayload,
   parseChatGPTRealtimeEvent,
+  parseChatGPTRealtimeSessionOptions,
+  parseChatGPTRealtimeTranscript,
   parseChatGPTRealtimeAppServerEvent,
   parseChatGPTRealtimeToolInvocation,
   resolveConfig,
@@ -29,6 +31,7 @@ describe("ChatGPT Realtime", () => {
       language_code: "fr-FR",
     });
     expect(advanced.voice_session_id).toBe(advanced.voice_status_request_id);
+    expect(buildChatGPTRealtimeSession({ language: "EN-us" }).language_code).toBe("en-US");
     expect(advanced.client_tools).toEqual([]);
     expect(advanced).toMatchObject({
       backend_reasoning_effort: "high",
@@ -42,10 +45,11 @@ describe("ChatGPT Realtime", () => {
     expect(standard.model_slug).toBe("explicit-compat-model");
     expect(standard.model_slug_advanced).toBeUndefined();
     expect(() => buildChatGPTRealtimeSession({ voice: "" })).toThrow("`voice`");
+    expect(() => buildChatGPTRealtimeSession({ language: "not_a_locale" })).toThrow("`language`");
     expect(() => buildChatGPTRealtimeSession({ timezoneOffsetMinutes: 2000 })).toThrow("timezoneOffsetMinutes");
     expect(() => buildChatGPTRealtimeSession({ historyAndTrainingDisabled: true })).toThrow("must be false");
     expect(() => buildChatGPTRealtimeSession({ transport: "wm", voiceMode: "advanced" })).toThrow("must be `wingman`");
-    expect(() => buildChatGPTRealtimeSession({ transport: "bogus" as "wm" })).toThrow("`transport`");
+    expect(() => buildChatGPTRealtimeSession({ transport: "bogus" as "wm" })).toThrow("session.transport");
     expect(() => buildChatGPTRealtimeSession({ transport: "vp" })).toThrow("`model` is required");
     expect(() => buildChatGPTRealtimeSession({
       clientTools: [{
@@ -54,6 +58,35 @@ describe("ChatGPT Realtime", () => {
         parameters: { type: "object" },
       }] as unknown as never[],
     })).toThrow("reserved first-party device tool IDs");
+  });
+
+  test("extracts user transcripts and assistant captions", () => {
+    expect(parseChatGPTRealtimeTranscript({
+      type: "user_transcription_text",
+      payload: { transcript: "hello" },
+    })).toMatchObject({ kind: "user_transcript", text: "hello" });
+    expect(parseChatGPTRealtimeTranscript({
+      type: "live_captioning_text",
+      text: "Hi there",
+    })).toMatchObject({ kind: "assistant_caption", text: "Hi there" });
+    expect(parseChatGPTRealtimeTranscript({ type: "state_update" })).toBeUndefined();
+  });
+
+  test("validates the complete Realtime session boundary", () => {
+    expect(parseChatGPTRealtimeSessionOptions({
+      transport: "wm",
+      voice: "vale",
+      language: null,
+      conversationMode: { kind: "primary_assistant" },
+    })).toEqual({
+      transport: "wm",
+      voice: "vale",
+      language: null,
+      conversationMode: { kind: "primary_assistant" },
+    });
+    expect(() => parseChatGPTRealtimeSessionOptions({ voice: 4 })).toThrow("session.voice");
+    expect(() => parseChatGPTRealtimeSessionOptions({ conversationMode: [] })).toThrow("conversationMode");
+    expect(() => parseChatGPTRealtimeSessionOptions({ privateFlag: true })).toThrow("Unsupported");
   });
 
   test("posts multipart SDP with server-side ChatGPT auth", async () => {

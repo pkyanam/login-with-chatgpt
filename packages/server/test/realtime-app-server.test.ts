@@ -1,4 +1,6 @@
 import { describe, expect, test } from "bun:test";
+import { access } from "node:fs/promises";
+import { join } from "node:path";
 import {
   ChatGPTRealtimeAppServerSession,
   chatgptPlanType,
@@ -11,6 +13,44 @@ function jwt(payload: Record<string, unknown>): string {
 }
 
 describe("ChatGPTRealtimeAppServerSession", () => {
+  test("rejects spawn failures and removes temporary credentials", async () => {
+    const session = new ChatGPTRealtimeAppServerSession({
+      tokens: { accessToken: "access", accountId: "acct_123", refreshToken: "refresh" },
+      tools: [],
+      executeTool: async () => ({ output: {} }),
+      command: [`missing-login-with-chatgpt-test-${crypto.randomUUID()}`],
+    });
+
+    await expect(session.start({ sdp: "v=0\r\n" })).rejects.toThrow();
+
+    const home = (session as unknown as { home: string }).home;
+    await expect(access(join(home, "auth.json"))).rejects.toThrow();
+  });
+
+  test("does not pass unrelated server secrets to the app-server process", async () => {
+    const secretName = "LWC_APP_SERVER_TEST_SECRET";
+    process.env[secretName] = "must-not-leak";
+    const session = new ChatGPTRealtimeAppServerSession({
+      tokens: { accessToken: "access", accountId: "acct_123" },
+      tools: [],
+      executeTool: async () => ({ output: {} }),
+      command: [
+        process.execPath,
+        "-e",
+        `process.exit(process.env.${secretName} ? 23 : 0)`,
+      ],
+    });
+
+    try {
+      await expect(session.start({ sdp: "v=0\r\n" })).rejects.toThrow();
+      expect((session as unknown as { process: { exitCode: number | null } }).process.exitCode).toBe(0);
+      const home = (session as unknown as { home: string }).home;
+      await expect(access(join(home, "auth.json"))).rejects.toThrow();
+    } finally {
+      delete process.env[secretName];
+    }
+  });
+
   test("preserves the signed ChatGPT plan entitlement", () => {
     const accessToken = jwt({
       "https://api.openai.com/auth": {
@@ -228,7 +268,7 @@ describe("ChatGPTRealtimeAppServerSession", () => {
     });
     expect(events).toContainEqual({
       type: "error",
-      message: "Confirmation completed, but its spoken acknowledgement failed: voice transport closed",
+      message: "Confirmation completed, but its spoken acknowledgement failed.",
     });
     expect(events.at(-1)).toEqual({
       type: "tool.completed",

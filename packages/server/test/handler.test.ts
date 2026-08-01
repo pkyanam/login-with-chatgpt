@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { createChatGPTHandler } from "../src/index.ts";
+import { createChatGPTHandler, type RealtimeBridgeEvent } from "../src/index.ts";
 import { createMockFetch, createOpenAIMock, jsonResponse, makeAccessToken, makeIdToken, makeJwt } from "./helpers.ts";
 
 const BASE = "https://app.dev/api/chatgpt";
@@ -134,6 +134,14 @@ describe("createChatGPTHandler", () => {
       error: "realtime_transport_not_allowed",
       transport: "vp",
     });
+
+    const invalidSession = await handler.handler(new Request(`${BASE}/realtime`, {
+      method: "POST",
+      headers: { cookie, "content-type": "application/json" },
+      body: JSON.stringify({ sdp: "v=0\r\no=- browser-offer", session: { voice: 4 } }),
+    }));
+    expect(invalidSession.status).toBe(400);
+    expect(await invalidSession.json()).toMatchObject({ error: "invalid_realtime_request" });
   });
 
   test("refuses to reuse Codex login tokens for the GPT Live /wm transport", async () => {
@@ -216,7 +224,7 @@ describe("createChatGPTHandler", () => {
           },
           sessionFactory: (options) => {
             sessionOptions = options;
-            return fakeSession as never;
+            return fakeSession;
           },
         },
       },
@@ -225,6 +233,17 @@ describe("createChatGPTHandler", () => {
     const cookie = cookieFrom(login);
     clock += 2000;
     await handler.handler(new Request(`${BASE}/status`, { headers: { cookie } }));
+
+    const unsupportedSession = await handler.handler(new Request(`${BASE}/realtime/app-server`, {
+      method: "POST",
+      headers: { cookie, "content-type": "application/json" },
+      body: JSON.stringify({
+        sdp: "v=0\r\no=- browser-offer",
+        session: { language: "en-US" },
+      }),
+    }));
+    expect(unsupportedSession.status).toBe(400);
+    expect(sessionOptions).toBeUndefined();
 
     const started = await handler.handler(new Request(`${BASE}/realtime/app-server`, {
       method: "POST",
@@ -305,6 +324,107 @@ describe("createChatGPTHandler", () => {
     );
     expect(removed.status).toBe(200);
     expect(closed).toBe(true);
+  });
+
+  test("serializes concurrent app-server starts for one login session", async () => {
+    let clock = 1000;
+    let releaseFirst!: () => void;
+    let markFirstStarted!: () => void;
+    const firstStarted = new Promise<void>((resolve) => { markFirstStarted = resolve; });
+    const firstGate = new Promise<void>((resolve) => { releaseFirst = resolve; });
+    const created: Array<{ id: string; closed: boolean }> = [];
+    const handler = createChatGPTHandler({
+      fetch: createOpenAIMock({ pollsUntilAuthorized: 1 }),
+      secret: "test-secret",
+      now: () => clock,
+      realtime: {
+        appServer: {
+          tools: [],
+          executeTool: async () => ({ output: {} }),
+          sessionFactory: () => {
+            const state = { id: `live_${created.length + 1}`, closed: false };
+            created.push(state);
+            return {
+              id: state.id,
+              start: async () => {
+                if (state.id === "live_1") {
+                  markFirstStarted();
+                  await firstGate;
+                }
+                return "v=0\r\no=- app-server-answer";
+              },
+              onEvent: () => () => {},
+              resolveConfirmation: async () => ({ output: {} }),
+              close: async () => { state.closed = true; },
+            };
+          },
+        },
+      },
+    });
+    const login = await handler.handler(new Request(`${BASE}/login`, { method: "POST" }));
+    const cookie = cookieFrom(login);
+    clock += 2000;
+    await handler.handler(new Request(`${BASE}/status`, { headers: { cookie } }));
+    const start = () => handler.handler(new Request(`${BASE}/realtime/app-server`, {
+      method: "POST",
+      headers: { cookie, "content-type": "application/json" },
+      body: JSON.stringify({ sdp: "v=0\r\no=- browser-offer" }),
+    }));
+
+    const first = start();
+    await firstStarted;
+    const second = start();
+    await Promise.resolve();
+    expect(created).toHaveLength(1);
+
+    releaseFirst();
+    expect((await first).status).toBe(201);
+    expect((await second).status).toBe(201);
+    expect(created).toHaveLength(2);
+    expect(created[0]?.closed).toBe(true);
+    await handler.handler(new Request(`${BASE}/logout`, { method: "POST", headers: { cookie } }));
+    expect(created[1]?.closed).toBe(true);
+  });
+
+  test("does not publish an app-server session that closed during startup", async () => {
+    let clock = 1000;
+    const listeners = new Set<(event: RealtimeBridgeEvent) => void>();
+    const handler = createChatGPTHandler({
+      fetch: createOpenAIMock({ pollsUntilAuthorized: 1 }),
+      secret: "test-secret",
+      now: () => clock,
+      realtime: {
+        appServer: {
+          tools: [],
+          executeTool: async () => ({ output: {} }),
+          sessionFactory: () => ({
+            id: "closed_during_start",
+            start: async () => {
+              for (const listener of listeners) listener({ type: "session.closed" });
+              return "v=0\r\no=- stale-answer";
+            },
+            onEvent: (listener) => {
+              listeners.add(listener);
+              return () => { listeners.delete(listener); };
+            },
+            resolveConfirmation: async () => {},
+            close: async () => {},
+          }),
+        },
+      },
+    });
+    const login = await handler.handler(new Request(`${BASE}/login`, { method: "POST" }));
+    const cookie = cookieFrom(login);
+    clock += 2000;
+    await handler.handler(new Request(`${BASE}/status`, { headers: { cookie } }));
+
+    const response = await handler.handler(new Request(`${BASE}/realtime/app-server`, {
+      method: "POST",
+      headers: { cookie, "content-type": "application/json" },
+      body: JSON.stringify({ sdp: "v=0\r\no=- browser-offer" }),
+    }));
+    expect(response.status).toBe(502);
+    expect(await response.json()).toMatchObject({ error: "realtime_app_server_start_failed" });
   });
 
   test("enforces responses proxy model allowlist", async () => {

@@ -231,7 +231,10 @@ bun add @opencoredev/loginwithchatgpt-core
 ```
 
 ```ts title="voice.ts"
-import { connectChatGPTRealtime } from "@opencoredev/loginwithchatgpt-core";
+import {
+  CHATGPT_REALTIME_VOICES,
+  connectChatGPTRealtime,
+} from "@opencoredev/loginwithchatgpt-core";
 
 const call = await connectChatGPTRealtime({
   session: {
@@ -240,10 +243,13 @@ const call = await connectChatGPTRealtime({
     language: "en-US",
   },
   onStateChange: (state) => console.log(state),
-  onEvent: (event) => {
-    if (event.type === "user_transcription_text") console.log(event);
+  onTranscript: ({ kind, text }) => {
+    // Render the user's recognized speech and the assistant's live captions.
+    appendTranscript(kind, text);
   },
 });
+
+console.log(CHATGPT_REALTIME_VOICES);
 
 // Explicit controls are useful for buttons and push-to-talk.
 call.stopSpeaking();
@@ -253,6 +259,26 @@ call.setOutputMuted(false);
 // Always release the microphone, peer, data channel, and audio graph.
 call.close();
 ```
+
+### Preferred language and voice
+
+Set `session.language` to the user's preferred spoken language. The SDK checks
+that it is a valid [BCP 47 language tag](https://www.rfc-editor.org/rfc/bcp/bcp47.txt),
+canonicalizes casing such as `EN-us` to `en-US`, and sends it in both the Live
+session and request headers. This improves speech recognition; it does not lock
+the conversation to one language. The user can still ask the assistant to
+speak another language during the call.
+
+The current documented voices are exported as `CHATGPT_REALTIME_VOICES`:
+`arbor`, `breeze`, `cove`, `ember`, `juniper`, `maple`, `sol`, `spruce`, and
+`vale`. The `voice` option remains a string so a newly released upstream voice
+can work before this catalog is updated. To change voice, close the current
+call and reconnect. Pass the same `conversationId` if the upstream account and
+transport allow the new call to continue that chat.
+
+`language` configures the direct `/wm` handshake. The app-server bridge does
+not currently expose a verified speech-recognition language field; users can
+still request another spoken language conversationally.
 
 `connectChatGPTRealtime()` does the following:
 
@@ -299,6 +325,9 @@ The resolved `ChatGPTRealtimeConnection` exposes:
 
 Use `onBridgeEvent` for application-tool status. `onEvent` remains the native
 WebRTC/data-channel stream; these two event sources are intentionally separate.
+Use `onTranscript` for the parsed `user_transcription_text` and
+`live_captioning_text` events. It reports `{ kind, text, event }`, keeping the
+raw event available when an application needs transport-specific fields.
 
 For push-to-talk, disable automatic barge-in, call `startListening()` on press,
 and `stopListening()` on release.
@@ -309,6 +338,36 @@ still creates an inert send-only video transceiver because the observed private
 handshake expects that SDP m-line; this is transport compatibility, not a video
 feature or a claim about every ChatGPT Voice surface.
 
+## ChatGPT Voice feature coverage
+
+ChatGPT Voice is a product with account-, plan-, device-, and region-specific
+features. This package is an experimental transport SDK, so some items from
+OpenAI's [ChatGPT Voice guide](https://help.openai.com/en/articles/20001274-chatgpt-voice)
+are provided by the SDK, some come from ChatGPT upstream, and some must be
+built by the host application.
+
+| ChatGPT Voice feature | Coverage in this SDK |
+| --- | --- |
+| Speak and listen in one chat | Supported over browser WebRTC. Keep and render the application's chat history separately. |
+| Type during a voice call | Supported with `relayMessage(text)`. |
+| User transcript and assistant captions | Supported with `onTranscript`; raw events remain available through `onEvent`. Upstream transcripts may differ from the exact audio. |
+| Mute, stop, resume, and exit | Supported with input/output mute, listening controls, `stopSpeaking()`, and idempotent `close()`. |
+| Interrupt the assistant | Supported by explicit `stopSpeaking()` and optional local voice-activity barge-in. Noisy rooms may need threshold tuning or push-to-talk. |
+| Preferred language | Supported for direct `/wm` calls with `session.language`; users may also ask for another language during a call. |
+| Voice selection | Current names are exported in `CHATGPT_REALTIME_VOICES`. Changing voice requires a new call. |
+| Tone, pace, and response style | Ask conversationally. The SDK does not claim a precise playback-speed control or apply ChatGPT personality settings. |
+| One active voice call | The built-in app-server routes enforce one call per login session. Direct-route hosts should enforce the same product rule if needed. |
+| Web search, memory, visual widgets, and model intelligence | Upstream/account capabilities. The private transport does not guarantee them or expose stable feature toggles. |
+| Images and files in the chat | Not sent by this voice transport. A host may show normal chat content beside the call, subject to its separate chat API. |
+| Camera and screen sharing | Not supported. Those are currently device/mode-specific ChatGPT application features, and this helper rejects video input. |
+| Background conversations, Start with Voice, and CarPlay | Host application and operating-system features. Browser background throttling and microphone policy still apply. |
+| Usage limits and maximum call duration | Enforced upstream according to the signed-in account. Hosts should handle close/error events and display their own session timer if needed. |
+| Training, retention, and audio sharing controls | Controlled by the user's OpenAI account and workspace. The SDK does not override those settings; its own credentials and stored transcripts remain the host's responsibility. |
+| Work/Codex tools | Supported through the Node/Bun app-server bridge and explicit application-owned confirmations. Arbitrary tools are not supported on direct `/wm`. |
+
+Availability can change upstream. Treat a successful signaling response and
+runtime events as the source of truth for a particular signed-in account.
+
 ## Session schema
 
 The browser sends ergonomic camel-case `ChatGPTRealtimeSessionOptions`. The
@@ -317,11 +376,11 @@ core package converts them into the upstream wire keys shown below.
 | SDK option | Upstream key | Default / behavior |
 | --- | --- | --- |
 | `transport` | endpoint selection | `"wm"` (GPT Live); `"vp"` and `"vps"` are explicit compatibility options |
-| `voice` | `voice` | `"juniper"` |
+| `voice` | `voice` | `"juniper"`; current names are exported in `CHATGPT_REALTIME_VOICES` |
 | `voiceMode` | `voice_mode` | `"wingman"` for `/wm` |
 | `model` | `requested_default_model`, `model_slug` | Empty for direct `/wm`; required or strongly recommended for app-server delegated execution so the selected entitlement is preserved. |
 | `advancedModel` | `model_slug_advanced` | Private `vp` compatibility field; no product-feature guarantee. |
-| `language` | `language_code` | `null`; browser helper may pass locale |
+| `language` | `language_code` and `OAI-Language` | `null`; a valid BCP 47 preferred language for direct `/wm` calls |
 | `conversationId` | `conversation_id` | `null` for a new conversation |
 | `parentMessageId` | `parent_message_id` | omitted |
 | `timezone`, `timezoneOffsetMinutes` | `timezone`, `timezone_offset_min` | browser timezone; server fallback is UTC / `0` |
@@ -478,11 +537,21 @@ concurrent exchanges for one user so two requests cannot race that rotation.
 The helper distinguishes a true 401 expiry from a retryable 403 edge rejection.
 
 Custom Node/Bun backends can also instantiate
-`ChatGPTRealtimeAppServerSession` directly. They must provide server-held
+`ChatGPTRealtimeAppServerSession` from
+`@opencoredev/loginwithchatgpt-server/realtime-app-server` directly. They must provide server-held
 tokens, token refresh, dynamic schemas, execution and confirmation handlers,
 user-scoped session storage, an authenticated event stream, a confirmation
 route, TTL cleanup, and model propagation. Most applications should use the
 built-in handler routes, which provide that lifecycle.
+
+The app-server bridge requires a long-lived Node/Bun instance because its child
+process and Live-session registry are process-local. Use sticky routing for all
+routes belonging to one Live session; edge and request-isolated serverless
+runtimes cannot host this bridge. The normal login and response routes remain
+Web-standard when `realtime.appServer` is unset. The child starts in a private
+temporary directory, receives only required system environment variables, and
+runs with a read-only Codex sandbox instead of inheriting the hosting server's
+application secrets.
 
 Treat every dynamic-tool invocation as untrusted input. Revalidate it against
 the configured server-side schema and allowlist, bind execution to the

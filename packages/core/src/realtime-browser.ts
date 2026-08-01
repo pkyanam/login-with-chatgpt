@@ -7,11 +7,13 @@ import {
   encodeChatGPTRealtimeEvent,
   getChatGPTRealtimePayload,
   parseChatGPTRealtimeEvent,
+  parseChatGPTRealtimeTranscript,
   parseChatGPTRealtimeToolInvocation,
   type ChatGPTRealtimeAction,
   type ChatGPTRealtimeEvent,
   type ChatGPTRealtimeSessionOptions,
   type ChatGPTRealtimeState,
+  type ChatGPTRealtimeTranscript,
   type ChatGPTRealtimeToolInvocation,
 } from "./realtime.ts";
 
@@ -47,6 +49,8 @@ export interface ConnectChatGPTRealtimeOptions {
   connectionTimeoutMs?: number;
   signal?: AbortSignal;
   onEvent?: (event: ChatGPTRealtimeEvent) => void;
+  /** Parsed user speech and assistant captions for an in-chat transcript UI. */
+  onTranscript?: (transcript: ChatGPTRealtimeTranscript) => void;
   /**
    * Compatibility hook for ChatGPT's reserved first-party client tools.
    * `/wm` rejects arbitrary application tool IDs.
@@ -107,9 +111,17 @@ export async function connectChatGPTRealtime(
       video: false,
     },
   );
-  const peer = options.peerConnection ?? new RTCPeerConnection({ bundlePolicy: "max-bundle" });
-  const channel = peer.createDataChannel("", { negotiated: true, id: 0 });
-  const audio = options.audioElement ?? document.createElement("audio");
+  let peer: RTCPeerConnection;
+  let channel: RTCDataChannel;
+  let audio: HTMLAudioElement;
+  try {
+    peer = options.peerConnection ?? new RTCPeerConnection({ bundlePolicy: "max-bundle" });
+    channel = peer.createDataChannel("", { negotiated: true, id: 0 });
+    audio = options.audioElement ?? document.createElement("audio");
+  } catch (error) {
+    if (ownsStream) stream.getTracks().forEach((track) => track.stop());
+    throw error;
+  }
   audio.autoplay = true;
 
   let state: ChatGPTRealtimeState = "connecting";
@@ -127,11 +139,6 @@ export async function connectChatGPTRealtime(
   const fail = (cause: unknown) => options.onError?.(
     cause instanceof Error ? cause : new Error(String(cause)),
   );
-
-  for (const track of stream.getTracks()) peer.addTrack(track, stream);
-  if ((options.addVideoTransceiver ?? true) && stream.getVideoTracks().length === 0) {
-    peer.addTransceiver("video", { direction: "sendonly" });
-  }
 
   peer.addEventListener("track", (event) => {
     if (event.track.kind !== "audio") return;
@@ -163,6 +170,8 @@ export async function connectChatGPTRealtime(
           ),
         })).catch(fail);
       }
+      const transcript = parseChatGPTRealtimeTranscript(event);
+      if (transcript) options.onTranscript?.(transcript);
       options.onEvent?.(event);
     }).catch(fail);
   });
@@ -179,6 +188,10 @@ export async function connectChatGPTRealtime(
   };
 
   try {
+    for (const track of stream.getTracks()) peer.addTrack(track, stream);
+    if ((options.addVideoTransceiver ?? true) && stream.getVideoTracks().length === 0) {
+      peer.addTransceiver("video", { direction: "sendonly" });
+    }
     const offer = await peer.createOffer();
     await peer.setLocalDescription(offer);
     await waitForIceGathering(peer, options.iceGatheringTimeoutMs ?? 2_500, options.signal);
@@ -227,6 +240,23 @@ export async function connectChatGPTRealtime(
     }));
   }
 
+  const close = () => {
+    if (closed) return;
+    closed = true;
+    if (restoreTimer) clearTimeout(restoreTimer);
+    cleanups.forEach((cleanup) => cleanup());
+    channel.close();
+    peer.close();
+    if (ownsStream) stream.getTracks().forEach((track) => track.stop());
+    audio.srcObject = null;
+    setState("halted");
+  };
+  if (options.signal) {
+    options.signal.addEventListener("abort", close, { once: true });
+    cleanups.push(() => options.signal?.removeEventListener("abort", close));
+    if (options.signal.aborted) close();
+  }
+
   return {
     peerConnection: peer,
     dataChannel: channel,
@@ -244,17 +274,7 @@ export async function connectChatGPTRealtime(
     updateTool: (callId, status, detail) => send(createChatGPTRealtimeToolUpdate(callId, status, detail)),
     setInputMuted: (muted) => stream.getAudioTracks().forEach((track) => { track.enabled = !muted; }),
     setOutputMuted: (muted) => { outputMuted = muted; audio.muted = muted; },
-    close: () => {
-      if (closed) return;
-      closed = true;
-      if (restoreTimer) clearTimeout(restoreTimer);
-      cleanups.forEach((cleanup) => cleanup());
-      channel.close();
-      peer.close();
-      if (ownsStream) stream.getTracks().forEach((track) => track.stop());
-      audio.srcObject = null;
-      setState("halted");
-    },
+    close,
   };
 }
 

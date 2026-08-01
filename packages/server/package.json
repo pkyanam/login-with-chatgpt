@@ -10,6 +10,12 @@
       "types": "./dist/index.d.ts",
       "import": "./dist/index.js",
       "default": "./dist/index.js"
+    },
+    "./realtime-app-server": {
+      "bun": "./src/realtime-app-server.ts",
+      "types": "./dist/realtime-app-server.d.ts",
+      "import": "./dist/realtime-app-server.js",
+      "default": "./dist/realtime-app-server.js"
     }
   },
   "main": "./dist/index.js",
